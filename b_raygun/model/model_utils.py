@@ -36,7 +36,7 @@ class ConvBlock(nn.Module):
         super(ConvBlock, self).__init__()
         self.c1 = ConvMasked(dim     , dim // 2, kernel_size=convkernel)
         self.s1 = nn.SiLU()
-        self.c2 = ConvMasked(dim // 2, dim // 4, kernel_size=convkernel)
+        self.c2 = ConvMasked(dim // 2, dim // 4, kernel_size=convkernel // 2)
         self.s2 = nn.SiLU()
         self.c3 = ConvMasked(dim // 4, dim // 2, kernel_size=convkernel)
         self.s3 = nn.SiLU()
@@ -44,6 +44,8 @@ class ConvBlock(nn.Module):
     
     def forward(self, x, mask = None): 
         x = rearrange(x, "b n c -> b c n")
+        if mask is not None:
+            x = x * mask.unsqueeze(1)
         x = self.s1(self.c1(x, mask))
         x = self.s2(self.c2(x, mask))
         x = self.s3(self.c3(x, mask))

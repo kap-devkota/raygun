@@ -29,6 +29,8 @@ import lightning as L
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning.loggers import WandbLogger
+import wandb
+from datetime import datetime
 
 torch.set_float32_matmul_precision('high')
 
@@ -55,22 +57,31 @@ def main(config: DictConfig):
     esmmodel              = esmmodel.to(0)
     esmmodel.eval()
 
-    if not config["debug_mode"]:
-        wandb_logger = WandbLogger(project = "Batched Training Raygun")
+    if config["log_wandb"]:
+        wandb_logger = WandbLogger(project = "BATCH-TRAINING-RAYGUN")
     else:
         wandb_logger = None
 
     logger.info(f"Using pre-trained checkpoint.")
     _, _, hyparams = torch.hub.load('rohitsinghlab/raygun', 
                                     'pretrained_uniref50_95000_750M')
+    
     model          = Raygun(numencoders = config["numencoders"],
                             numdecoders = config["numdecoders"],
                             esmdecodertotokenfile = "data/models/esm-decoder.sav",
                             esm_alphabet = esmalphabet.to_dict())
+    
+    if "checkpoint" in config and config["checkpoint"] is not None:
+        checkpoint = torch.load(config["checkpoint"])
+        model.load_state_dict(checkpoint["model_state_dict"])
+        
     rayltmodule    = RaygunLightning(model, 
                                      esmalphabet,
-                                     lr = config["lr"],
-                                     log_wandb = not config["debug_mode"])         
+                                     lr         = config["lr"],
+                                     log_wandb  = config["log_wandb"],
+                                     save_every = config["save_every"],
+                                     save_dir   = config["model_saveloc"])
+
     ## train and validation loaders
     traindata = RaygunData(fastafile = config["trainfasta"],
                            alphabet  = esmalphabet,

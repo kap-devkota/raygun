@@ -20,7 +20,9 @@ class RaygunLightning(L.LightningModule):
                 crossentropyloss = 1., 
                 reconstructionloss = 1., 
                 replicateloss = 1.,
-                log_wandb = False):
+                log_wandb = False, 
+                save_every = 1,
+                save_dir   = None):
         super().__init__()
         self.model  = raygun
         self.lr     = lr
@@ -36,6 +38,8 @@ class RaygunLightning(L.LightningModule):
         self.decodermodel     = raygun.esmdecoder
         self.toktoalphdict    = {k: i for i, k in esmalphabet.to_dict().items()}
         self.log_wandb        = log_wandb
+        self.save_every       = save_every
+        self.save_dir         = save_dir
 
     def wlog(self, *p): 
         if self.log_wandb:
@@ -78,7 +82,7 @@ class RaygunLightning(L.LightningModule):
             result, mem, crossloss = self.model(e, mask = mask, token = tokens)
             tloss                  = tloss + self.crossentropyloss * crossloss
             self.trainlosses["Cross-Entropy Loss"].append(crossloss.item())
-            self.wlog("Cross-Entropy Loss", crossloss.item())
+            self.wlog("Cross-Entropy Loss", crossloss.item() if crossloss.item() < 10 else 10)
         else:
             result, mem            = self.model(e, mask = mask)
         if self.reconstructloss > 0:
@@ -86,13 +90,13 @@ class RaygunLightning(L.LightningModule):
                                                 e * mask.unsqueeze(-1))
             tloss                  = tloss + self.reconstructloss * recloss
             self.trainlosses["Reconstruction Loss"].append(recloss.item())
-            self.wlog("Reconstruction Loss", recloss.item())
+            self.wlog("Reconstruction Loss", recloss.item() if recloss.item() < 10 else 10)
         if self.replicateloss > 0:
             decodedemb = self.model.decode(mem, newlengths)
             reploss    = F.mse_loss(mem, self.model.encoder(decodedemb)) 
             tloss      = tloss + self.replicateloss * reploss 
             self.trainlosses["Replicate Loss"].append(reploss.item())
-            self.wlog("Replicate Loss", reploss.item())
+            self.wlog("Replicate Loss", reploss.item() if reploss.item() < 10 else 10)
         blosumv, blosumr = self.get_blosum_score(result.detach(), tokens.detach())
         self.wlog("Blosum score", blosumv)
         self.wlog("Blosum ratio", blosumr)
@@ -105,6 +109,10 @@ class RaygunLightning(L.LightningModule):
         logging.info(logf)
         self.trainlosses = defaultdict(list)
         self.epoch      += 1
+        if (self.epoch % self.save_every == 0) and (self.save_dir is not None):
+            checkpoint_path = f"{self.save_dir}/model-{self.epoch}.sav"
+            torch.save({"model_state_dict": self.model.state_dict()}, 
+                      checkpoint_path)
         return
 
     def validation_step(self, batch, batch_idx):
