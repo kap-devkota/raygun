@@ -28,9 +28,11 @@ import logging
 import lightning as L
 import hydra
 from omegaconf import DictConfig, OmegaConf
-from pytorch_lightning.loggers import WandbLogger
+from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.callbacks import ModelCheckpoint
 import wandb
 from datetime import datetime
+from pathlib import Path
 
 torch.set_float32_matmul_precision('high')
 
@@ -69,18 +71,20 @@ def main(config: DictConfig):
     model          = Raygun(numencoders = config["numencoders"],
                             numdecoders = config["numdecoders"],
                             esmdecodertotokenfile = "data/models/esm-decoder.sav",
-                            esm_alphabet = esmalphabet.to_dict())
-    
-    if "checkpoint" in config and config["checkpoint"] is not None:
-        checkpoint = torch.load(config["checkpoint"])
-        model.load_state_dict(checkpoint["model_state_dict"])
-        
+                            esm_alphabet = esmalphabet.to_dict())    
     rayltmodule    = RaygunLightning(model, 
                                      esmalphabet,
-                                     lr         = config["lr"],
-                                     log_wandb  = config["log_wandb"],
-                                     save_every = config["save_every"],
-                                     save_dir   = config["model_saveloc"])
+                                     lr          = config["lr"],
+                                     log_wandb   = config["log_wandb"],
+#                                      save_dir    = config["model_saveloc"],
+                                     traininglog = config["model_saveloc"] + "/error-log.txt")
+    if "checkpoint" in config and config["checkpoint"] is not None:
+        ckptpath   = Path(config["checkpoint"])
+        checkpoint = torch.load(ckptpath, weights_only = True)
+        if ckptpath.suffix == ".sav_original":
+            rayltmodule.model.load_state_dict(checkpoint["model_state_dict"])
+        else:
+            rayltmodule.load_state_dict(checkpoint["state_dict"])
 
     ## train and validation loaders
     traindata = RaygunData(fastafile = config["trainfasta"],
@@ -100,9 +104,25 @@ def main(config: DictConfig):
                             batch_size = config["batch_size"], 
                             collate_fn = validdata.collatefn)
     # Start the training
-    trainer = L.Trainer(logger = wandb_logger, accelerator="gpu", 
+    
+    ## checkpoint
+    chk_callback = ModelCheckpoint(
+                        monitor = "val_blosum_ratio",
+                        mode    = "max",
+                        save_top_k = config["num_to_save"], 
+                        save_weights_only = True, 
+                        dirpath = config["model_saveloc"],
+                        filename = "model-{epoch:02d}-{val_blosum_ratio:.4f}"
+                    )
+    
+    trainer = L.Trainer(logger = wandb_logger, 
+                        callbacks = [chk_callback],
+                        accelerator="gpu", 
                         devices=config["devices"], strategy="ddp",
-                        max_epochs=config["epoch"])
+                        max_epochs=config["epoch"], 
+                        gradient_clip_val = config["clip"],
+                        gradient_clip_algorithm = "value")
+    
     trainer.fit(rayltmodule, trainloader, 
                 validloader)
     return 

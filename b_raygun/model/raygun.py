@@ -64,7 +64,7 @@ class RaygunEncoder(nn.Module):
         residues = [enc]
         for mod in self.encoders:
             xresidue = mod(x, mask = mask)
-            residue  = mod(self.reduce(xresidue, mask = mask, error_c = None)) 
+            residue  = mod(self.reduce(xresidue, mask = mask, error_c = error_c)) # 
             x        = x + xresidue
             residues.append(residue)
 
@@ -163,7 +163,7 @@ class Raygun(nn.Module):
         return alph
 
     def shrinkwithencoder(self, encoder, length):
-        batch, _, _ = x.shape
+        batch, _, _ = encoder.shape
         assert batch == 1, "Only accepts batch=1"
 
         self.eval()

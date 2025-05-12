@@ -20,9 +20,8 @@ class RaygunLightning(L.LightningModule):
                 crossentropyloss = 1., 
                 reconstructionloss = 1., 
                 replicateloss = 1.,
-                log_wandb = False, 
-                save_every = 1,
-                save_dir   = None):
+                log_wandb = False,
+                traininglog = "traininglog.txt"):
         super().__init__()
         self.model  = raygun
         self.lr     = lr
@@ -38,14 +37,29 @@ class RaygunLightning(L.LightningModule):
         self.decodermodel     = raygun.esmdecoder
         self.toktoalphdict    = {k: i for i, k in esmalphabet.to_dict().items()}
         self.log_wandb        = log_wandb
-        self.save_every       = save_every
-        self.save_dir         = save_dir
+        self.traininglog      = traininglog
+        
+        # loss regularization
+        self.runid            = 0
+        self.tlosshistory     = []
+        self.coolingtime      = 100
+        self.averagingwindow  = 500
+        self.std_threshold    = 15
 
-    def wlog(self, *p): 
-        if self.log_wandb:
-            self.log(*p) 
-        else:
-            logging.info(f"{p[0]} : {p[1]}")
+    def log_error(self, batch, loss):
+        idx, seq       = zip(*batch)
+        df             = pd.DataFrame({"id" : idx, 
+                                       "seq" : seq})
+        running_avg    = np.mean(self.tlosshistory)
+        running_std    = np.std(self.tlosshistory)
+        with open(self.traininglog, "a") as logf:
+            logf.write(f"\n\nEpoch {self.epoch}, run {self.runid}")
+            logf.write(f"\n\tBatch Loss   : {loss}\n")
+            logf.write(f"\n\tRunning Loss : {running_avg}" 
+                       + u" \u00B1 " 
+                       + f"{running_std}\n")
+            logf.write(df.to_string())
+            
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.model.parameters(), lr = self.lr)
@@ -67,8 +81,8 @@ class RaygunLightning(L.LightningModule):
         """
         token, embedding and mask should not contain the begin and end tokens
         """
-        tokens, e, mask, _ = batch
-        bshape, seq_, _    = e.shape
+        tokens, e, mask, binfo = batch
+        bshape, seq_, _        = e.shape
         if mask is None:
             assert bshape == 1, "Batch is larger than 1 but no mask provided"
             ## required when replicateloss > 0
@@ -82,7 +96,7 @@ class RaygunLightning(L.LightningModule):
             result, mem, crossloss = self.model(e, mask = mask, token = tokens)
             tloss                  = tloss + self.crossentropyloss * crossloss
             self.trainlosses["Cross-Entropy Loss"].append(crossloss.item())
-            self.wlog("Cross-Entropy Loss", crossloss.item() if crossloss.item() < 10 else 10)
+            self.log("Cross-Entropy Loss", crossloss.item() if crossloss.item() < 10 else 10)
         else:
             result, mem            = self.model(e, mask = mask)
         if self.reconstructloss > 0:
@@ -90,17 +104,34 @@ class RaygunLightning(L.LightningModule):
                                                 e * mask.unsqueeze(-1))
             tloss                  = tloss + self.reconstructloss * recloss
             self.trainlosses["Reconstruction Loss"].append(recloss.item())
-            self.wlog("Reconstruction Loss", recloss.item() if recloss.item() < 10 else 10)
+            self.log("Reconstruction Loss", recloss.item() if recloss.item() < 10 else 10)
         if self.replicateloss > 0:
             decodedemb = self.model.decode(mem, newlengths)
             reploss    = F.mse_loss(mem, self.model.encoder(decodedemb)) 
             tloss      = tloss + self.replicateloss * reploss 
             self.trainlosses["Replicate Loss"].append(reploss.item())
-            self.wlog("Replicate Loss", reploss.item() if reploss.item() < 10 else 10)
+            self.log("Replicate Loss", reploss.item() if reploss.item() < 10 else 10)
         blosumv, blosumr = self.get_blosum_score(result.detach(), tokens.detach())
-        self.wlog("Blosum score", blosumv)
-        self.wlog("Blosum ratio", blosumr)
-        return tloss
+        self.log("Blosum score", blosumv)
+        self.log("Blosum ratio", blosumr)
+        
+        self.tlosshistory = self.tlosshistory[-self.averagingwindow:]
+        
+        self.runid       += 1
+        if self.runid < self.coolingtime:
+            self.tlosshistory.append(tloss.item())
+            return tloss
+        
+        running_avg = np.mean(self.tlosshistory)
+        running_std = np.std(self.tlosshistory)
+        
+        if tloss.item() >= running_avg + self.std_threshold * running_std:
+            self.log_error(binfo, tloss.item())
+            tloss_ = float(tloss.item())
+            return tloss / tloss_ * running_avg ## this would essentially ignore the batch
+        else:
+            self.tlosshistory.append(tloss.item())
+            return tloss
 
     def on_train_epoch_end(self):
         logf = f"Completed Training Epoch {self.epoch+1}: "
@@ -109,10 +140,6 @@ class RaygunLightning(L.LightningModule):
         logging.info(logf)
         self.trainlosses = defaultdict(list)
         self.epoch      += 1
-        if (self.epoch % self.save_every == 0) and (self.save_dir is not None):
-            checkpoint_path = f"{self.save_dir}/model-{self.epoch}.sav"
-            torch.save({"model_state_dict": self.model.state_dict()}, 
-                      checkpoint_path)
         return
 
     def validation_step(self, batch, batch_idx):
@@ -120,8 +147,8 @@ class RaygunLightning(L.LightningModule):
         result, mem        = self.model(e, mask = mask)
         blosum_curr, blosum_curr_ratio = self.get_blosum_score(result,
                                                                 tokens)
-        self.wlog("Val Blosum Score", blosum_curr)
-        self.wlog("Val Blosum Ratio", blosum_curr_ratio)
+        self.log("val_blosum_score", blosum_curr)
+        self.log("val_blosum_ratio", blosum_curr_ratio)
         self.vallosses["Blosum Score"].append(blosum_curr)
         self.vallosses["Blosum ratio"].append(blosum_curr_ratio)
 
@@ -145,7 +172,31 @@ class RaygunLightning(L.LightningModule):
             tok = token[i][:li].tolist() 
             alphabets.append([self.toktoalphdict[t] for t in tok])
         return alphabets
-
+    
+    def return_sequences_from_embs(self, embeddings, lengths = None):
+        """
+        embedding = [batch, seq, dim]
+        """
+        if len(embeddings.shape) == 2:
+            embeddings = embeddings.unsqueeze(0)
+        b, n, d = embeddings.shape
+        if b != 1:
+            assert lengths is not None and len(lengths) == b, \
+            "for larger batches, you need to specify the lengths. Additionally, the #lengths should equal the batch size"
+        else:
+            lengths = [n]
+        pred_alphs = []
+        for i in range(b):
+            logits = self.decodermodel(embeddings[i][None, :lengths[i], :])
+            pred_token = torch.argmax(logits, dim = -1).cpu().numpy()
+            pred_alph  = self.convert_tokens_to_alph(pred_token, [lengths[i]])
+            pred_alph  = "".join(pred_alph[0])
+            if b == 1:
+                return pred_alph
+            else:
+                pred_alphs.append(pred_alph)
+        return pred_alphs
+        
     def get_blosum_score(self, embedding, true_token):
         """
         embedding: tensor [batch, seqlen, dim]
